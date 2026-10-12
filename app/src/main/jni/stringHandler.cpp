@@ -58,14 +58,8 @@ namespace ZhenxiRunTime::stringHandlerHook {
   hook_libc_function(handle, #func, (void*) new_##func, (void**) &orig_##func); \
 
 
-#define HOOK_DEF(ret, func, ...) \
-  ret (*orig_##func)(__VA_ARGS__); \
-  ret new_##func(__VA_ARGS__)
-
-#define JNITRACE_HOOK_DEF(ret, func, ...) \
-  ret (*orig_##func)(__VA_ARGS__); \
-  ret new_##func(__VA_ARGS__)
-
+//HOOK_DEF/JNITRACE_HOOK_DEF 用HookUtils.h里的定义(那里的orig_指针会初始化为nullptr),
+//这里不要再重定义一遍,否则编译器会报macro redefined
 
 #define  ORIG_BUFF_SIZE  100
 

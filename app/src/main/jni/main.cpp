@@ -15,6 +15,7 @@
 
 #include "includes/JnitraceForC.h"
 #include "includes/stringHandler.h"
+#include "ZhenxiLog.h"
 
 /**
  * 日志文件的生命周期由这里统一持有。
