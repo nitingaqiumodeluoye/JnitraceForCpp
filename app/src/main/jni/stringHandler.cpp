@@ -51,6 +51,41 @@
 using namespace std;
 /**
  * 因为需要hook一些string处理的函数,所以尽可能使用C语言去实现这些功能
+ *
+ * ======================= 关于bionic的IFUNC函数(必读) =======================
+ * bionic里 strlen / strcmp / strcpy 是 IFUNC(GNU indirect function)符号,
+ * 加载时由resolver按CPU特性挑一个实现(通常是 *aarch64 的SIMD版本):
+ *     strcpy_resolver:
+ *       adrp x9, __strcpy_aarch64_mte
+ *       adrp x10, __strcpy_aarch64
+ *       tst  w8, #0x4
+ *       csel x0, x10, x9, eq           <-- dlsym("strcpy")拿到的就是这个结果
+ * 所以dlsym拿到的其实是 __strcpy_aarch64 这类实现函数的地址。
+ *
+ * 这些SIMD实现在入口就把x17(IP1)算好,而且整个主循环都依赖它:
+ *     __strcpy_aarch64:
+ *       bti  c
+ *       and  x9, x1, #0xfff
+ *       mov  x12, #0x0101010101010101
+ *       and  x17, x1, #0xf             <-- 入口初始化x17
+ *       ...
+ *       sub  x2, x1, x17               <-- 循环体继续用x17算指针
+ *
+ * 而Dobby的arm64跳板回跳时正好用x17做中转寄存器:
+ *     ldr x17, ...; br x17
+ * 跳板覆盖了入口那几条指令(x17的初始化就在其中),执行完再用x17跳回函数体,
+ * 于是回到函数体时x17已经是跳板地址,函数拿它算指针 -> SIGSEGV。
+ * 实测(Android 12 / arm64): 一打开App,RenderThread分配GraphicBuffer调strcpy时必崩:
+ *     #00 __strcpy_aarch64+216  ldp x4, x5, [x2]     (x2 = x1 - 被污染的x17)
+ *     #01 libjnitrace.so  new_strcpy+4388
+ *
+ * 所以 strlen / strcmp / strcpy **不能用orig(跳板)转发**,改用mylibc.h里的自实现。
+ * 它们语义足够简单,自实现与libc等价,代价只是少了SIMD加速 —— 调试工具可以接受。
+ *
+ * 其余hook的函数都确认过入口不依赖x17,才保留orig转发:
+ *   __strlen_chk / strstr / fgets / strdup 都是普通FUNC(入口是stp x29,x30标准帧),
+ *   不会把x17当作跨指令的状态,可以安全转发。
+ * ==========================================================================
  */
 namespace ZhenxiRunTime::stringHandlerHook {
 
@@ -91,9 +126,6 @@ namespace ZhenxiRunTime::stringHandlerHook {
         my_strcat(buff,value);  \
      }  \
 
-#define GET_ADDRESS \
- auto address = getAddressHex((void*)((char *) \
-            __builtin_return_address(0) - ((size_t) info.dli_fbase))); \
 
 
 # define CLEAN_APPEND(buff, value, size) \
@@ -210,20 +242,25 @@ namespace ZhenxiRunTime::stringHandlerHook {
         return buffer;
     }
 
-    static void write(const char *msg, Dl_info info) {
+    /**
+     * 日志输出实现。
+     *
+     * callerOffset 是"调用方在它自己所属模块里的偏移",需要在hook函数里算好传进来:
+     *     (size_t) __builtin_return_address(0) - (size_t) info.dli_fbase
+     *
+     * 原实现是在这个函数内部取 __builtin_return_address(0),那时拿到的是
+     * libjnitrace.so 自己的地址,再减去目标so的基址,算出来的偏移没有任何意义。
+     */
+    static void traceWriteImpl(const char *msg, Dl_info info, size_t callerOffset) {
         INIT_ORIG_BUFF
-        if ((size_t) info.dli_fbase > 0) {
-            GET_ADDRESS
-            if (address != nullptr) {
-                APPEND(buff, "<")
-                APPEND(buff, address)
-                APPEND(buff, ">")
-                free((void *) address);
-            }
-        }
         APPEND(buff, "[")
         APPEND(buff, match_so_name)
-        APPEND(buff, "]")
+        APPEND(buff, "] ")
+        if (info.dli_fbase != nullptr) {
+            char offsetBuff[32] = {};
+            snprintf(offsetBuff, sizeof(offsetBuff), "<0x%zx>", callerOffset);
+            APPEND(buff, offsetBuff)
+        }
         APPEND(buff, msg)
         if (isSave && hookStrHandlerOs != nullptr) {
             //和jnitrace用的是同一把锁,否则两个模块同时往同一个ofstream里写会互相踩
@@ -237,6 +274,16 @@ namespace ZhenxiRunTime::stringHandlerHook {
             free((void *) buff);
         }
     }
+
+    /**
+     * 统一日志出口(宏)。
+     *
+     * callerOffset在宏展开处取值,所以拿到的是hook函数的调用者地址,
+     * 而不是traceWriteImpl自己的返回地址 —— 这正是原实现算错的地方。
+     */
+#define traceWrite(msg, info) \
+    traceWriteImpl((msg), (info), \
+        (size_t) __builtin_return_address(0) - (size_t) (info).dli_fbase)
 
 
 
@@ -253,7 +300,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
                 APPEND(buff, "  arg2-> ")
                 APPEND(buff, IS_NULL(n))
                 APPEND(buff, "\n")
-                write(buff, info);
+                traceWrite(buff, info);
             }
             return ret;
 
@@ -271,7 +318,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
                 APPEND(buff, "strlen_chk() arg1 -> ")
                 APPEND(buff, IS_NULL(__s))
                 APPEND(buff, "\n")
-                write(buff, info);
+                traceWrite(buff, info);
             }
             return size;
         }
@@ -280,18 +327,18 @@ namespace ZhenxiRunTime::stringHandlerHook {
 
     HOOK_DEF(size_t, strlen, const char *__s) {
         DL_INFO
+        //不能用orig_strlen(见文件头的IFUNC说明),用自实现
+        size_t size = my_strlen(__s);
         IS_MATCH
-            size_t size = orig_strlen(__s);
             if (size > 0) {
                 INIT_ORIG_BUFF
                 APPEND(buff, "strlen() arg1 -> ")
                 APPEND(buff, IS_NULL(__s))
                 APPEND(buff, "\n")
-                write(buff, info);
+                traceWrite(buff, info);
             }
-            return size;
         }
-        return orig_strlen(__s);
+        return size;
     }
 
 //char* strcat(char* __dst, const char* __src);
@@ -308,7 +355,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
                 APPEND(buff, IS_NULL(ret))
             }
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -317,34 +364,42 @@ namespace ZhenxiRunTime::stringHandlerHook {
 //int strcmp(const char* __lhs, const char* __rhs)
     HOOK_DEF(int, strcmp, const char *__lhs, const char *__rhs) {
         DL_INFO
-        IS_MATCH int ret = orig_strcmp(__lhs, __rhs);
+        //不能用orig_strcmp(见文件头的IFUNC说明)。
+        //libc的strcmp碰到nullptr会崩,这里给出确定结果,免得调试工具把目标程序带崩
+        int ret;
+        if (__lhs == nullptr || __rhs == nullptr) {
+            ret = (__lhs == __rhs) ? 0 : (__lhs != nullptr ? 1 : -1);
+        } else {
+            ret = my_strcmp(__lhs, __rhs);
+        }
+        IS_MATCH
             INIT_ORIG_BUFF
             APPEND(buff, "strcmp() arg1 -> ")
             APPEND(buff, IS_NULL(__lhs))
             APPEND(buff, "  arg2-> ")
             APPEND(buff, IS_NULL(__rhs))
             APPEND(buff, "\n")
-            write(buff, info);
-            return ret; }
-        return orig_strcmp(__lhs, __rhs);
+            traceWrite(buff, info);
+        }
+        return ret;
     }
 //char* strcpy(char* __dst, const char* __src);
     HOOK_DEF(char *, strcpy, char *__dst, const char *__src) {
-
         DL_INFO
-        IS_MATCH char *ret = orig_strcpy(__dst, __src);
+        //不能用orig_strcpy(见文件头的IFUNC说明),ARM64上必崩
+        if (__dst != nullptr && __src != nullptr) {
+            my_stpcpy(__dst, __src);
+        }
+        IS_MATCH
             INIT_ORIG_BUFF
             APPEND(buff, "strcpy() arg1 -> ")
             APPEND(buff, IS_NULL(__dst))
             APPEND(buff, "  arg2-> ")
             APPEND(buff, IS_NULL(__src))
-
             APPEND(buff, "\n")
-            write(buff, info);
-            return ret;
-
+            traceWrite(buff, info);
         }
-        return orig_strcpy(__dst, __src);
+        return __dst;
     }
 //int sprintf(char* __s, const char* __fmt, ...)
     HOOK_DEF(int, sprintf, char *__s, const char *__fmt, char *p...) {
@@ -358,7 +413,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg3-> ")
             APPEND(buff, IS_NULL(p))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -375,7 +430,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg2-> ")
             APPEND(buff, IS_NULL(p))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -392,7 +447,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg2-> ")
             APPEND(buff, IS_NULL(delim))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret; }
         return orig_strtok(str, delim);
     }
@@ -406,7 +461,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "strdup() arg1 -> ")
             APPEND(buff, IS_NULL(__s))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return orig_strdup(__s);
 
         }
@@ -426,7 +481,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg2-> ")
             APPEND(buff, IS_NULL(__rhs))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -443,7 +498,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg2-> ")
             APPEND(buff, IS_NULL(src))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -459,7 +514,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg2-> ")
             APPEND_INT(buff, __size)
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -487,7 +542,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg3-> ")
             APPEND_INT(buff, __n)
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             if (destHex != nullptr) {
                 free(destHex);
             }
@@ -514,7 +569,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg3-> ")
             APPEND(buff, IS_NULL(__fmt))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -532,7 +587,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "malloc() arg1 -> ")
             APPEND_INT(buff, __byte_count)
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
 
         }
@@ -551,7 +606,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg3-> ")
             APPEND(buff, IS_NULL(__fmt))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
         }
         return orig_vsnprintf(__buf, __size, __fmt, __args);
@@ -570,7 +625,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg3-> ")
             APPEND_INT(buff, n)
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             if (destHex != nullptr) {
                 free(destHex);
             }
@@ -596,7 +651,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg3-> ")
             APPEND_INT(buff, n)
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
         }
         return orig_strncat(dest, src, n);
@@ -610,7 +665,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "strlwr() arg1 -> ")
             APPEND(buff, IS_NULL((char *) str))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
         }
         return orig_strlwr(str);
@@ -624,7 +679,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "strupr() arg1 -> ")
             APPEND(buff, IS_NULL((char *) str))
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
         }
         return orig_strupr(str);
@@ -640,7 +695,7 @@ namespace ZhenxiRunTime::stringHandlerHook {
             APPEND(buff, "  arg2-> ")
             APPEND_INT(buff, c)
             APPEND(buff, "\n")
-            write(buff, info);
+            traceWrite(buff, info);
             return ret;
         }
         return orig_strchr(str, c);
