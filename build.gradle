@@ -8,11 +8,13 @@ buildscript {
         targetSdkVersion = 33
     }
     repositories {
-        maven { url 'https://maven.aliyun.com/repository/google' }
-        maven{url 'https://maven.aliyun.com/nexus/content/groups/public/'}
-        maven{ url'https://maven.aliyun.com/nexus/content/repositories/jcenter'}
+        //官方源放前面:CI(海外runner)访问aliyun镜像会返回502,导致依赖解析直接失败。
+        //镜像放后面只作为本地(国内)网络下官方源不可用时的兜底。
         google()
         mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/nexus/content/repositories/jcenter' }
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:8.0.2'
@@ -27,6 +29,9 @@ allprojects {
         flatDir {
             dirs 'libs'
         }
+        //同上:官方源优先,避免国内镜像在海外runner上502把构建打挂
+        google()
+        mavenCentral()
         maven {
             name "aliyunmaven"
             url "https://maven.aliyun.com/repository/public"
@@ -35,8 +40,6 @@ allprojects {
             name "aliyunGoogle"
             url "https://maven.aliyun.com/repository/google"
         }
-
-        google()
     }
 }
 task clean(type: Delete) {
