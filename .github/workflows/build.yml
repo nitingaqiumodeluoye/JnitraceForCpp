@@ -64,7 +64,11 @@ jobs:
         run: |
           mkdir -p artifacts
           find app/build/outputs/apk -name "*.apk" -exec cp {} artifacts/ \;
-          find app/build/intermediates -name "libjnitrace.so" -exec cp {} artifacts/ \; || true
+          # 同一个so在每个ABI的obj目录下都有一份,直接cp会互相覆盖,按ABI重命名
+          while IFS= read -r so; do
+            abi="$(basename "$(dirname "$so")")"
+            cp "$so" "artifacts/libjnitrace-${abi}.so"
+          done < <(find app/build/intermediates -path "*/obj/*" -name "libjnitrace.so")
           ls -lh artifacts
 
       - name: Upload apk
