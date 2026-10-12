@@ -40,6 +40,15 @@ jobs:
           yes | "${SDKMANAGER}" --sdk_root="${ANDROID_SDK_ROOT}" --install             "ndk;${NDK_VERSION}"             "cmake;${CMAKE_VERSION}"             "platforms;android-33"             "build-tools;30.0.3"
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
+      # runner是全新的,~/.android/debug.keystore每次都会重新生成,
+      # 导致每次构建出的debug apk签名都不同,装到手机上会报
+      # INSTALL_FAILED_UPDATE_INCOMPATIBLE。缓存起来保证签名稳定。
+      - name: Cache debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:

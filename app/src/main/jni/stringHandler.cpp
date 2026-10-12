@@ -233,14 +233,6 @@ namespace ZhenxiRunTime::stringHandlerHook {
         return buffer;
     }
 
-    char *getAddressHex(void *ptr) {
-        if (ptr == nullptr) {
-            return nullptr;
-        }
-        char *buffer = (char *) malloc(20);
-        sprintf(buffer, "0x%lx", (uintptr_t) ptr);
-        return buffer;
-    }
 
     /**
      * 日志输出实现。
