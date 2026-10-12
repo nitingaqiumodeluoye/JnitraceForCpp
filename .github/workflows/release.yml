@@ -9,6 +9,7 @@ permissions:
   contents: write
 
 env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
   NDK_VERSION: 25.2.9519653
   CMAKE_VERSION: 3.22.1
 
@@ -25,18 +26,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Cache NDK
         uses: actions/cache@v4
         with:
           path: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
           key: ndk-${{ env.NDK_VERSION }}
 
+      # 不使用 android-actions/setup-android:它会执行已经被移除的 `sdkmanager tools` 而失败。
       - name: Install NDK and CMake
         run: |
-          sdkmanager --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+          SDKMANAGER="$(find "${ANDROID_SDK_ROOT}/cmdline-tools" -name sdkmanager -type f | sort | tail -n 1)"
+          echo "sdkmanager: ${SDKMANAGER}"
+          yes | "${SDKMANAGER}" --sdk_root="${ANDROID_SDK_ROOT}" --install             "ndk;${NDK_VERSION}"             "cmake;${CMAKE_VERSION}"             "platforms;android-33"             "build-tools;30.0.3"
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Cache Gradle
