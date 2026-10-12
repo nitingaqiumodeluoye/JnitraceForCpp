@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: 25.2.9519653
+  CMAKE_VERSION: 3.22.1
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+          key: ndk-${{ env.NDK_VERSION }}
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build apk
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Package artifacts
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME:-manual}"
+          mkdir -p release
+          find app/build/outputs/apk -name "*.apk" -exec cp {} release/ \;
+          # 32/64位目标so单独打包,方便直接丢进目标app里做分析
+          mkdir -p release/so
+          find app/build/intermediates -path "*arm64-v8a*" -name "libjnitrace.so" -exec cp {} release/so/libjnitrace-arm64-v8a.so \; || true
+          find app/build/intermediates -path "*armeabi-v7a*" -name "libjnitrace.so" -exec cp {} release/so/libjnitrace-armeabi-v7a.so \; || true
+          cd release && zip -r "../jnitrace-${VERSION}.zip" . && cd ..
+          ls -lh release "jnitrace-${VERSION}.zip"
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.apk
+            jnitrace-*.zip
+          generate_release_notes: true
+          body: |
+            ## JnitraceForCpp ${{ github.ref_name }}
+
+            构建产物：
+            - `app-debug.apk`：已用 debug key 签名，可直接安装（demo app，含 libjnitrace.so 与靶子 so）
+            - `app-release-unsigned.apk`：未签名，需要自行签名
+            - `jnitrace-*.zip`：APK + 单独抽出的 `libjnitrace.so`（arm64-v8a / armeabi-v7a）
+
+            使用方式见 README。
