@@ -46,6 +46,7 @@
 #include "common_macros.h"
 #include "HookUtils.h"
 #include "ZhenxiLog.h"
+#include "traceLog.h"
 
 using namespace std;
 /**
@@ -111,14 +112,23 @@ namespace ZhenxiRunTime::stringHandlerHook {
      */
     static bool isHookSecondRet = false;
 
-    static std::ofstream *hookStrHandlerOs;
-    static char *filterSoList[100] = {};
-    static char *forbidSoList[100] = {};
+    /**
+     * 过滤列表的最大条目数(原来是100且不校验下标,传入超过100个就会越界写)
+     */
+    static constexpr int MAX_FILTER_SO_COUNT = 32;
+
+    static std::ofstream *hookStrHandlerOs = nullptr;
+    static char *filterSoList[MAX_FILTER_SO_COUNT] = {};
+    static char *forbidSoList[MAX_FILTER_SO_COUNT] = {};
     static bool isHookAll = false;
 
     static bool isSave = false;
-    static char match_so_name[MATCH_SO_NAME_SIZE] = {};
-    static std::mutex supernode_ids_mux_;
+
+    /**
+     * 当前线程命中的so名。isLister()写入,write()读取,同一线程内成对使用,
+     * 用thread_local避免多线程互相覆盖。
+     */
+    static thread_local char match_so_name[MATCH_SO_NAME_SIZE] = {};
 
 
     static bool isAppFile(const char *path) {
@@ -185,6 +195,18 @@ namespace ZhenxiRunTime::stringHandlerHook {
         }
     }
 
+    /**
+     * 指针转成可打印字符串(调用者负责free)
+     */
+    static char *ptrToHex(const void *ptr) {
+        char *buffer = (char *) malloc(20);
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+        snprintf(buffer, 20, "%p", ptr);
+        return buffer;
+    }
+
     char *getAddressHex(void *ptr) {
         if (ptr == nullptr) {
             return nullptr;
@@ -209,10 +231,9 @@ namespace ZhenxiRunTime::stringHandlerHook {
         APPEND(buff, match_so_name)
         APPEND(buff, "]")
         APPEND(buff, msg)
-        if (isSave) {
-            if (hookStrHandlerOs != nullptr) {
-                (*hookStrHandlerOs) << buff;
-            }
+        if (isSave && hookStrHandlerOs != nullptr) {
+            //和jnitrace用的是同一把锁,否则两个模块同时往同一个ofstream里写会互相踩
+            TraceLog::writeLine(hookStrHandlerOs, buff);
         }
         LOG(INFO) << buff;
         if (msg != nullptr) {
@@ -455,24 +476,30 @@ namespace ZhenxiRunTime::stringHandlerHook {
         DL_INFO
         IS_MATCH
 
-            void *ret;
-            if (orig_memcpy == nullptr) {
-                ret = orig_memcpy(destin, source, __n);
-            } else {
-                ret = my_memcpy(destin, source, __n);
-            }
+            //原实现把判断写反了:orig_memcpy为null时反而去调用nullptr,直接崩
+            void *ret = (orig_memcpy != nullptr) ? orig_memcpy(destin, source, __n)
+                                                 : my_memcpy(destin, source, __n);
             if (source == nullptr || destin == nullptr) {
                 return ret;
             }
+            //memcpy的内容不以\0结尾,原来当字符串打印会越界读,这里只打印指针和长度
+            char *destHex = ptrToHex(destin);
+            char *sourceHex = ptrToHex(source);
             INIT_ORIG_BUFF
             APPEND(buff, "memcpy() arg1 -> ")
-            APPEND(buff, IS_NULL((char *) destin))
+            APPEND(buff, destHex)
             APPEND(buff, "  arg2-> ")
-            APPEND(buff, IS_NULL((char *) source))
+            APPEND(buff, sourceHex)
             APPEND(buff, "  arg3-> ")
             APPEND_INT(buff, __n)
             APPEND(buff, "\n")
             write(buff, info);
+            if (destHex != nullptr) {
+                free(destHex);
+            }
+            if (sourceHex != nullptr) {
+                free(sourceHex);
+            }
             return ret;
         }
 
@@ -539,15 +566,23 @@ namespace ZhenxiRunTime::stringHandlerHook {
     HOOK_DEF(void *, memmove, void *dest, const void *src, size_t n) {
         DL_INFO
         IS_MATCH auto ret = orig_memmove(dest, src, n);
+            char *destHex = ptrToHex(dest);
+            char *sourceHex = ptrToHex(src);
             INIT_ORIG_BUFF
-            APPEND(buff, "vsnprintf() arg1 -> ")
-            APPEND(buff, IS_NULL((char *) dest))
+            APPEND(buff, "memmove() arg1 -> ")
+            APPEND(buff, destHex)
             APPEND(buff, "  arg2-> ")
-            APPEND(buff, IS_NULL((char *) src))
+            APPEND(buff, sourceHex)
             APPEND(buff, "  arg3-> ")
             APPEND_INT(buff, n)
             APPEND(buff, "\n")
             write(buff, info);
+            if (destHex != nullptr) {
+                free(destHex);
+            }
+            if (sourceHex != nullptr) {
+                free(sourceHex);
+            }
             return ret;
 
         }
@@ -677,12 +712,20 @@ void stringHandler::hookStrHandler(bool hookAll, const std::list<string> &forbid
 
     int i = 0;
     for (const auto &string: forbid_list) {
+        if (i >= MAX_FILTER_SO_COUNT) {
+            LOGE("forbidSoList too many items, max is %d", MAX_FILTER_SO_COUNT)
+            break;
+        }
         forbidSoList[i] = strdup(string.c_str());
         LOG(ERROR) << "forbidSoList -> " << i << " " << forbidSoList[i];
         i++;
     }
     i = 0;
     for (const auto &string: filter_list) {
+        if (i >= MAX_FILTER_SO_COUNT) {
+            LOGE("filterSoList too many items, max is %d", MAX_FILTER_SO_COUNT)
+            break;
+        }
         filterSoList[i] = strdup(string.c_str());
         LOG(ERROR) << "filterSoList -> " << i << " " << filterSoList[i];
         i++;
@@ -704,12 +747,9 @@ void stringHandler::stopjnitrace() {
     for (auto str: filterSoList) {
         free(str);
     }
-    if (hookStrHandlerOs != nullptr) {
-        if (hookStrHandlerOs->is_open()) {
-            hookStrHandlerOs->close();
-        }
-        delete hookStrHandlerOs;
-    }
+    //文件流的生命周期由调用方(main.cpp)管理。
+    //原来这里delete一次,jnitrace的stopjnitrace()也delete同一个对象,会double free
+    hookStrHandlerOs = nullptr;
     isSave = false;
 }
 
