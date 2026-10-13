@@ -1,3 +1,9 @@
+> **本仓库已冻结（2026-10-13）**：jnitrace 核心能力已全部融合进
+> [XposedJniTrace](../XposedJniTrace)，那里是主力开发目标。
+> 本仓库保留作为**独立 so**（不依赖 Xposed，可配 frida/自写注入器使用）
+> 与 `xunwind`/`hidemaps`/`Dobby` 等 nativeLib 能力的来源。
+> 详见 [MAINTENANCE.md](MAINTENANCE.md)（含将来需要同步时的操作清单）。
+
 ## JnitraceForCpp
 
 ### 前言：
